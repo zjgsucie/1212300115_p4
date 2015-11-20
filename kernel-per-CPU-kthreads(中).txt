@@ -1,0 +1,113 @@
+优化因PER-CPU线程引起的操作系统颤抖问题
+
+本文档列出了Linux内核中的per-CPU线程，并提供了一些选项来控制操作系统的颤抖。注意，本文档中没有列举非per-CPU线程。为了减少因非per-CPU线程产生的操作系统颤抖，将它们捆绑成一个“事务管理”CPU。
+
+参考文献
+
+o	Documentation/IRQ-affinity.txt：将中断捆绑成CPU的一个集合
+o	Documentation/cgroups：使用cgroup将任务捆绑成CPU的一个集合
+o	man taskset：使用taskset命令将任务捆绑成CPU的一个集合
+o	man sched_setaffinity：使用系统调用sched_setaffinity()将任务捆绑成CPU的一个集合
+o	/sys/devices/system/cpu/cpuN/online：控制N个CPU的热连接状态，“0”表示离线，“1”表示在线
+o	为了充N个CPU中定位由内核产生的操作系统颤抖：
+
+		cd /sys/kernel/debug/tracing
+		echo 1 > max_graph_depth # Increase the "1" for more detail
+		echo function_graph > current_tracer
+		# run workload
+		cat per_cpu/cpuN/trace
+
+线程
+
+名字：ehca_comp/%u
+目的：周期性处理Infiniband-related工作
+为减少操作系统颤抖，可执行以下任意一种方案：
+1.	不使用eHCA Infiniband硬件，而选择不需要per-CPU线程的硬件。这可以防止这些线程一开始就被创建。(这有益于大部分人们。尽管这些硬件非常重要，但相对而言，它们已经过时了，而且它们的单元容量相对较小)
+2.	在其他CPU上执行eHCA-Infiniband-related任务，包括中断
+3.	为了是被选中的CPU只为相应的per-CPU线程提供服务，重新编写eHCA驱动
+
+名字：irq/%d-%s
+目的：操控线程中断
+为减少操作系统颤抖，可执行以下步骤：
+1.	使用irq affinity强制irq线程在其他CPU上执行
+
+名字：kcmtpd_ctr_%d
+目的：操控蓝牙工作
+为减少操作系统颤抖，可执行以下任意一种方案：
+1.	当这些线程不是一开始就被创建时，不使用蓝牙
+2.	使用irq affinity强制与蓝牙相关的线程中断，并在其他CPU上对所有与蓝牙有关的活动进行初始化
+
+名字：ksoftirqd/%u
+目的：当线程被创建或在大量读取时，执行softirq操作。
+为了减少操作系统颤抖，必须为每个softirq向量分别添加标签：
+TIMER_SOFTIRQ：执行以下所有步骤：
+1.	当CPU处于non-idle状态时，尽量避免它与内核接触，例如，避免系统调用，强制执行内核线程和中断
+2.	使FONFIG_HOTPLUG_CPU=y。一旦启动完成后，强制CPU离线，然后再使它上线。这会强制循环计时器转移至其他地方。如果是多处理器，则强制所有处理离线后，再使它们上线。如果你考虑将CPU上线，那么不要离线任何其他处理器，如果离线了，那么会使计时器强制跳转到你正在考虑上线的CPU。
+NET_TX_SOFTIRQ和NET_RX_SOFTIRQ：执行以下所有步骤：
+1.	强制转移网络中断至其他CPU
+2.	在其他CPU上初始化网络I/O
+3.	一旦启动你的应用，如果有些在CPU上运行的任务会导致操作系统颤抖，那么就要防止初始化CPU-hotplug操作。(你可以强制离线该CPU，然后在你启动应用前使它上线)
+BLOCK_SOFTIRQ：执行以下所有步骤
+1.	强制其他CPU响应块设备中断
+2.	在其他CPU上进行块I/O初始化
+3.	一旦启动你的应用，如果有些在CPU上运行的任务会导致操作系统颤抖，那么就要防止初始化CPU-hotplug操作。(你可以强制离线该CPU，然后在你启动应用前使它上线)
+BLOCK_IOPOLL_SOFTIRQ：执行以下所有步骤
+1.	强制其他CPU响应块设备中断
+2.	在其他CPU上进行块I/O及其投票初始化
+3.	一旦启动你的应用，如果有些在CPU上运行的任务会导致操作系统颤抖，那么就要防止初始化CPU-hotplug操作。(你可以强制离线该CPU，然后在你启动应用前使它上线)
+TASKLET_SOFTIRQ：执行以下一步以上操作
+1.	避免使用那些使用tasklet的驱动程序。(这些驱动程序包含类似于tasklet_schedule()的调用)
+2.	将所有必须使用的驱动程序从tasklet转换到工作队列
+3.	将使用tasklet的驱动程序包括涉及到这些驱动程序的I/O操作的中断强制转移到其他CPU上
+SCHED_SOFTIRQ：执行以下所有步骤
+1.	避免向CPU发送调度程序IPI并造成颤抖，例如，保证该CPU上至多一个有一个线程在运行。如果一个线程希望在唤醒的CPU上运行，那么，调度程序将发送一个IPI，结果将会使SCHED_SOFTIRQ并发执行。
+2.	设置CONFIG_RCU_NOCB_CPU=y，CONFIG_RCU_NOCB_CPU_ALL=y，CONFIG_NO_HZ_FULL=y，另外，确保要被消除颤抖的CPU被标记为带“nohz_full=”引导参数的自适应始终CPU。这减少了除颤CPU接受到的调度器时钟中断次数，也降低了被调度到在SCHED_SOFTIRQ目录下进行读取平衡工作的几率。
+3.	当CPU处于non-idle状态时，尽量避免它与内核接触，例如，避免系统调用，强制执行内核线程和中断。这进一步减少了除颤CPU接受到的调度器时钟中断次数。
+HRTIMER_SOFTIRQ：执行以下所有步骤
+1.	当CPU处于non-idle状态时，尽量避免它与内核接触，例如，避免系统调用，强制执行内核线程和中断。
+2.	使FONFIG_HOTPLUG_CPU=y。待启动完成后，强制CPU离线，然后再使它上线。这会强制循环计时器转移至其他地方。如果是多处理器，则强制所有处理离线后，再使它们上线。如果你考虑将CPU上线，那么不要离线任何其他处理器，如果离线了，那么会使计时器强制跳转到你正在考虑上线的CPU。
+RCU_SOFTIRQ：执行以下一步以上操作
+1.	执行以下所有步骤，释放回调函数，使CPU处于dyntick-idle或adaptive-tick状态：
+	a.	设置CONFIG_RCU_NOCB_CPU=y，CONFIG_RCU_NOCB_CPU_ALL=y，CONFIG_NO_HZ_FULL=y，另外，确保要被消除颤抖的CPU被标记为带“nohz_full=”引导参数的自适应始终CPU。将rcuo线程与能抵抗操作系统颤抖的事务管理CPU绑定。
+	b.	当CPU处于non-idle状态时，尽量避免它与内核接触，例如，避免系统调用，强制执行内核线程和中断。
+2.	激活RCU，执行以下所有步骤，通过dyntick-idle远程执行操作
+	a.	设置CONFIG_NO_HZ=y，CONFIG_RCU_FAST_NO_HZ=y。
+	b.	确保该CPU时常运行idle，允许其他CPU检测它是否通过了一个RCU静止状态。如果内核参数CONFIG_NO_HZ_FULL=y，用户空间操作同样允许其他CPU检测它是否通过了一个RCU静止状态。
+	c.	当CPU处于non-idle状态时，尽量避免它与内核接触，例如，避免系统调用，强制执行内核线程和中断。
+
+名字：hworker/%u:%d%s(cpu, id, 优先级)
+目的：执行工作队列请求
+为减少操作系统颤抖，可执行以下步骤：
+1.	在实时优先级下执行你的工作，该优先级允许你抢占kworker服务器。
+2.	通过传递WQ_SYSFS到工作队列的alloc_workqueue()，使给出的工作队列在sysfs文件系统中可见。通过使用/sys/devices/virtual/workqueue/*/cpumask的sysfs文件，可以将这样一个工作队列限制为CPU的一个给出的子集。使用“ls sys/devices/virtual/workqueue”可以显示WQ_SYSFS工作队列集合。工作队列保持器警告人们不要随意在工作队列中散布WQ_SYSFS。虽然增加一个WQ_SYSFS非常容易，但sysfs是用户/内核API的一部分，即使它被错误地添加，也很难将其移除，这是警告的原因。
+3.	执行以下操作中部分有需要的，来防止你的应用无法承受的操作系统颤抖产生：
+	a.	在建立内核时，设置CONFIG_SLUB=Y而不是设置CONFIG_SLAB=Y，因此可以避免slab分配器周期性使用每个CPU的工作队列来运行它的cache_reap()函数。
+	b.	避免使用oprofile，从而避免因调用wq_sync_buffer()而产生操作系统颤抖。
+	c.	限制CPU频率，不再进行CPU频率管理，从而减轻散热器及冷却技术的负担。如果使用正确或者CPU架构允许，你可以在建立内核时使用参数CONFIG_CPU_FREQ=n来避免每个CPU上的频率管理器周期性运行，包括cs_dbs_timer()和od_dbs_timer()。警告：请检查你的CPU说明书，确保在你的系统上这样做是安全的。
+	d.	对于版本3.18，Christoph Lameter承认在on-demand vmstat，CONFIG_SMP=y的操作系统中使用了vmstat_update()函数来预防操作系统颤抖，在版本3.18以前，几乎不可能完全摆脱操作系统颤抖，但你可以将一个很大的值写入/proc/sys/vm/stat_interval来降低CPU频率。其默认值为赫兹，一次间隔一秒钟。当然，值越大，会使你的虚拟内存统计量更新速度更慢。当然，你可以抢占vmstat_update()，在实时优先权下进行你的工作，但如果你的任务是CPU-bound的，那么这种做法是不可取的。然而，对于某些工作，Christoph Lameter的RFC块(基于更早的Gilad Ben-Yossef的RFC块)可以缩短或取消附加在vmstat后面的信息，详见https://lkml.org/lkml/2013/9/4/379。
+	e.	为了防止工作队列被区块层，在开机引导时使用参数“elevator=noop”。
+	f.	如果在high-end powerpc服务器上运行，那么设置CONFIG_PPC_RTAS_DAEMON=n。这可以防止RTAS服务器时刻在每个CPU上运行。(这需要编辑Kconfig文件，而且会使platform的RAS功能失效)通过rtas_event_scan()函数避免了颤抖。警告：请检查你的CPU说明书，确保在你的系统上这样做是安全的。
+	g.	如果在单元处理器上运行，在建立内核时，使CBE_CPUFREQ_SPU_GOVERNOR=n以防止spu_gov_work()造成的操作系统颤抖。警告：请检查你的CPU说明书，确保在你的系统上这样做是安全的。
+	h.	如果在PowerMAC上运行，建立内核时，使CONFIG_PMAC_RACKMETER=n来禁用CPU-meter，最终避免由rackmeter_do_timer()造成的操作系统颤抖。
+
+名字：rcuc/%u
+目的：在CONFIG_RCU_BOOST=y的内核中执行RCU回调函数。
+为了减少操作系统颤抖，执行以下一步以上操作：
+1.	建立内核时，使CONFIG_PREEMPT=n。这可以防止首先创建这些线程，也消除了RCU优先加速的要求。对于那些不需要快速响应的人物来说，这种方法是可行的。
+2.	建立内核时，使CONFIG_RCU_BOOST=n。这可以防止首先创建这些线程。仅当你的任务不需要RCU优先级加速时，这种方法是可行的。例如，当你确保所有CPU上的大量空闲时间时，才有可能在内核中执行。
+3.	建立内核时，使CONFIG_RCU_NOCB_CPU=y，CONFIG_RCU_NOCB_CPU_ALL=y，这可以释放线程的RCU回调函数，因为它们可能在对操作系统颤抖比较敏感的CPU上运行。这种方法可避免rcuc/%u没有任何任务执行，以至于它不会被唤醒。
+4.	确保CPU不会进入内核，避免在该CPU上初始化CPU热插操作。这是防止回调函数进入CPU队列的一种方法，也可以避免rcuc/%u没有任何任务执行。
+
+名字：rcuob/%d，rcuop/%d，和rcuos/%d
+目的：从对应的CPU中释放RCU回调函数。
+为了减少操作系统颤抖，执行以下一步以上操作：
+1.	使用affinity，cgroups，或其他结构强制这些线程在其他CPU上执行。
+2.	建立内核时，使CONFIG_RCU_NOCB_CPU=n，这可以防止首先创建这些线程。然而，请注意到这样做并不能消除操作系统颤抖，而是会把它切换到RCU_SOFTIRQ状态。
+
+名字：watchdog/%u
+目的：在每个CPU上检测软件锁。
+为了减少操作系统颤抖，执行以下一步以上操作：
+1.	建立内核时，使CONFIG_LOCKUP_DETECTOR=n，这可以防止首先创建这些线程。
+2.	引导时，使nosoftlockup=0，这样做可以防止这些线程被创建。其他相关的watchdog和软件锁引导参数也许能在Documentation/kernel-parameters.txt和Documentation/watchdog/watchdog-parameters.txt中找到。
+3.	向/proc/sys/kernel/watchdog发送0，禁用watchdog计时器。
+4.	向/proc/sys/kernel/watchdog_thresh发送大数值，来减少操作系统颤抖频率，在执行你的任务时，watchdog计时器已经下降到一个可以接受的水平。

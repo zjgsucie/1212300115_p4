@@ -1,0 +1,74 @@
+在Linux内核2.5(及以上)，USB设备驱动中添加了DMA控制程序，用于I/O的操作。API函数细节存于核心USB编程向导(来自源码的内核文档)。
+
+API函数总览
+
+尽管USB驱动程序必须使DMA缓存区就绪，但它们还是会不停地拒绝大部分DMA请求(见Documentation/DMA-API-HOWTO.txt)。这是内核2.4（及更早的版本）的工作方式。
+
+OR: 他们现在可以是DMA-aware的
+
+- 新的调用启用了DMA-aware驱动，使它们能够分配DMA缓存区并且，对已有的就绪DMA缓存区映射进行管理（见下方）。
+
+- URB添加了“传送DMA”域以及传送标志位来表示它是否有效。(控制请求有“设置DMA”，但驱动程序不得占用它)
+
+- 如果DMA-aware驱动没有映射DMA地址且设置URB_NO_TRANSFER_DMA_MAP，“USB内核”将映射该DMA地址，HCD将不会为URB管理DMA映射。
+
+- 部分“一般DMA API”可被USB设备驱动使用。请不要在USB接口或设备上使用“dma_set_mask()”函数；那将极有可能会使共享在该总线上的所有设备损坏。
+
+禁止复制
+
+这很好地避免了CPU复制不需要的数据。但会使开销增加，以及带来诸如无效缓存等不良影响。
+
+如果你总是从同一块缓存区大量传输小数据，那么本来用IOMMU来管理DMA映射的系统资源将会被耗尽。相比操作I/O，设置并拆除每一个IOMMU映射请求将会耗费更多的资源。
+
+出于那些特殊的情况，USB有基本的命令来分配少量的内存。他们想kmalloc和kfree版一样工作，提供你正确的地址类，让你将数据存储在urb->transfer_buffer和urb->transfer_dma中。你也可以在urb->transfer_flags中设置URB_NO_TRANSFER_DMA_MAP：
+
+	void *usb_alloc_coherent (struct usb_device *dev, size_t size,
+		int mem_flags, dma_addr_t *dma);
+
+	void usb_free_coherent (struct usb_device *dev, size_t size,
+		void *addr, dma_addr_t dma);
+
+绝大多数的驱动程序不能使用这些指令；它们不需要使用这一类的内存(“dma-coherent”)，而且由kmalloc()函数返回的内存可以很好地工作。
+
+返回的内存缓冲区是“dma-coherent”的；当你在内存使用中遇到障碍时，你可能需要抢占一个固定的内存。这不是使用流DMA映射，因此这有益于在系统上进行少量的I/O操作，否则将浪费一个IOMMU映射。(见Documentation/DMA-API-HOWTO.txt来获取“coherent”和“streaming”DMA映射的定义)
+
+高效访问N个页面中的一个(包括访问N个页面)
+
+大多数系统返回非高速缓冲内存，因为dma-coherent内存需要旁路CPU高速缓存或使用支持总线监听的高速缓存硬件。x86硬件具有总线监听功能，然而许多其他的系统使用软件来清除高速缓存线来防止DMA冲突。
+
+- 一些EHCI控制设备可以操作高记忆DMA传输
+
+很遗憾，现有的Linux DMA基础没有合理的方式来展现这些能力。无论如何，对于x86_32位系统来说，高记忆几乎是设计上的一个瑕疵。因此建议你不要把高记忆缓冲区传送进入USB设备。这很简单，也是默认的方式。只要别撤销它，如NETIF_F_HIGHDMA。
+
+这将使你的调用函数做一些反弹缓冲，例如从高速内存将数据复制到一般的DMA内存。如果你能够提出好的方式来解决这项问题(对于内存大于1G的32位机器)，就不用再提交块了。
+
+在已有的缓冲上工作
+
+如果一个设备没有进行过DMA地址空间映射，那么已有的缓冲将不能用DMA。但是，大部分缓冲数据可以使用这种DMA映射，将数据安全的传送到你的驱动程序。(见Documentation/DMA-API-HOWTO.txt第一节“What memory is DMA-able?”)
+
+- 当你使用分散列表时，你可以立即映射任何数据。在一些系统上，IOMMU中的弹回使分散列表成为一种单独的DMA传输：
+
+	int usb_buffer_map_sg (struct usb_device *dev, unsigned pipe,
+		struct scatterlist *sg, int nents);
+
+	void usb_buffer_dmasync_sg (struct usb_device *dev, unsigned pipe,
+		struct scatterlist *sg, int n_hw_ents);
+
+	void usb_buffer_unmap_sg (struct usb_device *dev, unsigned pipe,
+		struct scatterlist *sg, int n_hw_ents);
+
+在新的usb_sg_*()调用中，因为进行了DMA映射及采用了其他一些方式使分散表的I/O变得更快，也使得这个调用更方便使用。
+
+- 一些驱动程序可能更倾向于使用大型缓冲区映射及安全再利用同步模型。(如果没有再利用，则让USB内核操作映射与非映射)大型周期传输是一个很好的例子，相比于每次urb完成后都取消缓冲区映射，然后在下一次提交的时候再重新建立映射，缓冲区同步则开销更小。
+
+这些调用都使用初始的urb：使用这些调用时，urb->dev, urb->pipe, urb->transfer_buffer, and urb->transfer_buffer_length必须为有效(如果urb是一个控制请求，那么urb->setup_packet也必须为有效)：
+
+	struct urb *usb_buffer_map (struct urb *urb);
+
+	void usb_buffer_dmasync (struct urb *urb);
+
+	void usb_buffer_unmap (struct urb *urb);
+
+这些调用为你管理urb->transfer_dma，并且设置URB_NO_TRANSFER_DMA_MAP以保证USB内核不会对缓冲区进行映射或取消映射。在控制请求中，它们不能被setup_packer缓冲区所使用。
+
+部分接口当前没有被注释，因为它们没有当前用户。见源代码。除了同步DMA调用(底层DMA指令被修改)，如果你想使用它们，大部分接口还是可以轻松地注释回来。
